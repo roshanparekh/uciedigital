@@ -29,10 +29,7 @@ object TimeoutConstants {
       SpeedMode.speed8  -> (((4_000_000_000L / mbSerializerRatio) * timeoutMs).toLong),
       SpeedMode.speed12 -> (((6_000_000_000L / mbSerializerRatio) * timeoutMs).toLong),
       SpeedMode.speed16 -> (((8_000_000_000L / mbSerializerRatio) * timeoutMs).toLong),
-      SpeedMode.speed24 -> (((12_000_000_000L / mbSerializerRatio) * timeoutMs).toLong),
-      SpeedMode.speed32 -> (((16_000_000_000L / mbSerializerRatio) * timeoutMs).toLong),
-      SpeedMode.speed48 -> (((24_000_000_000L / mbSerializerRatio) * timeoutMs).toLong),
-      SpeedMode.speed64 -> (((32_000_000_000L / mbSerializerRatio) * timeoutMs).toLong)
+      SpeedMode.speed24 -> (((12_000_000_000L / mbSerializerRatio) * timeoutMs).toLong)
     )
   }
 }
@@ -232,6 +229,7 @@ object LTState extends ChiselEnum {
 //   io.mainbandCtrlIo.rxClkEn := false.B
 //   io.mainbandCtrlIo.rxValidEn := false.B
 //   io.mainbandCtrlIo.rxTrackEn := false.B
+//   timeoutFreqSel := SpeedMode.speed4
 //   io.phyCtrlIo.freqSel := SpeedMode.speed4
 
 //   // For the ready/valid for the lanes
@@ -528,3 +526,326 @@ object LTState extends ChiselEnum {
 //     } 
 //   }
 // }
+
+
+class LinkTrainingStateMachine(sbParams: SidebandParams, afeParams: AfeParams, retryW: Int = 4) extends Module {
+  private val timeoutMs = 0.008
+
+  val io = IO(new Bundle {
+    // Global controls
+    val startTraining = Input(Bool())
+    val pwrGood = Input(Bool())
+    val trainingBypass = Input(Bool())
+    val selectStateBypass = Input(LTState())
+
+    // MBInit inputs
+    val mbInitCalDone = Input(Bool())
+    val localPhySettings = Flipped(Valid(new MbInitPHYParamExchangeIO()))
+
+    // MBTrain inputs
+    val mbTrainGoToState = Flipped(Valid(MBTrainGoToState()))
+    val mbTrainTxSelfCalDone = Input(Bool())
+    val mbTrainRxClkCalDone = Input(Bool())
+    val phyInRetrain = Input(Bool())
+    val interpretBy8Lane = Input(Bool())
+    val maxErrorThresholdPerLane = Input(UInt(16.W))
+    val changeInRuntimeLinkCtrlRegs = Input(Bool())
+
+    // LinkInit handshake gates (from RDI/top-level policy)
+    val linkInitSafeToSendReq = Input(Bool())
+    val linkInitSafeToSendResp = Input(Bool())
+
+    // Status / control outputs
+    val currentState = Output(LTState())
+    val trainingTimedout = Output(Bool())
+    val error = Output(Bool())
+    val done = Output(Bool())
+
+    // Re-export key negotiated/training outputs
+    val negotiatedPhySettings = Valid(new MbInitPHYParamExchangeIO())
+    val mbTrainState = Output(MBTrainState())
+
+    // Physical interfaces
+    val sidebandCtrlIo = new SidebandCtrlIO()
+    val mainbandCtrlIo = new MainbandLaneCtrlIO(afeParams)
+    val sidebandLaneIo = new SidebandLaneIO(sbParams)
+    val phyCtrlIo = new PhyCtrlIO()
+  })
+
+  val currentStateReg = RegInit(LTState.sRESET)
+  val nextState = WireInit(currentStateReg)
+  currentStateReg := nextState
+  io.currentState := currentStateReg
+
+  // Timeouts are implemented only for standard package rates up to 24 GT/s.
+  val timeoutMapScala = TimeoutConstants.timeoutMap(afeParams.mbSerializerRatio, timeoutMs)
+  val timeoutWidth = log2Ceil(timeoutMapScala.values.max.toInt + 1)
+  val timeoutCounter = RegInit(0.U(timeoutWidth.W))
+
+  val timeoutFreqSel = WireDefault(SpeedMode.speed4)
+  val timeoutCyclesMax = Wire(UInt(timeoutWidth.W))
+  timeoutCyclesMax := timeoutMapScala(SpeedMode.speed24).U
+  switch(timeoutFreqSel) {
+    is(SpeedMode.speed4) { timeoutCyclesMax := timeoutMapScala(SpeedMode.speed4).U }
+    is(SpeedMode.speed8) { timeoutCyclesMax := timeoutMapScala(SpeedMode.speed8).U }
+    is(SpeedMode.speed12) { timeoutCyclesMax := timeoutMapScala(SpeedMode.speed12).U }
+    is(SpeedMode.speed16) { timeoutCyclesMax := timeoutMapScala(SpeedMode.speed16).U }
+    is(SpeedMode.speed24) { timeoutCyclesMax := timeoutMapScala(SpeedMode.speed24).U }
+  }
+
+  val timeoutCntEn = (currentStateReg =/= LTState.sRESET) &&
+                     (currentStateReg =/= LTState.sACTIVE) &&
+                     (currentStateReg =/= LTState.sL1_L2) &&
+                     (currentStateReg =/= LTState.sTRAINERROR)
+  val trainingTimedout = timeoutCounter === timeoutCyclesMax
+  io.trainingTimedout := trainingTimedout
+
+  when(nextState =/= currentStateReg) {
+    timeoutCounter := 0.U
+  }.elsewhen(timeoutCntEn && (timeoutCounter =/= timeoutCyclesMax)) {
+    timeoutCounter := timeoutCounter + 1.U
+  }
+
+  // RESET minimum wait (4ms of the 8ms timeout window)
+  val resetMinWait = RegInit(false.B)
+  when((currentStateReg === LTState.sRESET) && (timeoutCounter === (timeoutCyclesMax >> 1))) {
+    resetMinWait := true.B
+  }.elsewhen((currentStateReg =/= LTState.sRESET) && (nextState === LTState.sRESET)) {
+    resetMinWait := false.B
+  }
+
+  // Sub-FSM modules
+  val sbInitSM = Module(new SBInitSM(sbParams, timeoutMapScala(SpeedMode.speed24).toInt))
+  val mbInitSM = Module(new MBInitSM(afeParams, sbParams))
+  val mbTrainSM = Module(new MBTrainSM(afeParams, sbParams))
+  val linkInitSM = Module(new LinkInitSidebandHandshake(sbParams))
+  val trainErrorRequester = Module(new TrainErrorRequester(sbParams))
+  val trainErrorResponder = Module(new TrainErrorResponder(sbParams))
+
+  // Default starts/gates
+  sbInitSM.io.fsmCtrl.start := false.B
+  mbInitSM.io.fsmCtrl.start := false.B
+  mbTrainSM.io.fsmCtrl.start := false.B
+  linkInitSM.io.start := false.B
+  trainErrorRequester.io.sendReq := false.B
+  trainErrorResponder.io.sendResp := false.B
+
+  // MBInit wiring
+  mbInitSM.io.mbInitCalDone := io.mbInitCalDone
+  mbInitSM.io.localPhySettings := io.localPhySettings
+
+  // MBTrain wiring
+  mbTrainSM.io.goToState := io.mbTrainGoToState
+  mbTrainSM.io.mbTrainTxSelfCalDone := io.mbTrainTxSelfCalDone
+  mbTrainSM.io.mbTrainRxClkCalDone := io.mbTrainRxClkCalDone
+  mbTrainSM.io.phyInRetrain := io.phyInRetrain
+  mbTrainSM.io.interpretBy8Lane := io.interpretBy8Lane
+  mbTrainSM.io.maxErrorThresholdPerLane := io.maxErrorThresholdPerLane
+  mbTrainSM.io.changeInRuntimeLinkCtrlRegs := io.changeInRuntimeLinkCtrlRegs
+  val negotiatedRate = WireDefault(SpeedMode.speed4)
+  when(mbInitSM.io.negotiatedPhySettings.valid) {
+    switch(mbInitSM.io.negotiatedPhySettings.bits.maxDataRate(2, 0)) {
+      is(SpeedMode.speed4.asUInt) { negotiatedRate := SpeedMode.speed4 }
+      is(SpeedMode.speed8.asUInt) { negotiatedRate := SpeedMode.speed8 }
+      is(SpeedMode.speed12.asUInt) { negotiatedRate := SpeedMode.speed12 }
+      is(SpeedMode.speed16.asUInt) { negotiatedRate := SpeedMode.speed16 }
+      is(SpeedMode.speed24.asUInt) { negotiatedRate := SpeedMode.speed24 }
+    }
+  }
+  mbTrainSM.io.negotiatedMaxDataRate := negotiatedRate
+  mbTrainSM.io.pllLock := io.phyCtrlIo.pllLock
+  mbTrainSM.io.currLocalTxFunctionalLanes := mbInitSM.io.localFunctionalLanes
+  mbTrainSM.io.currRemoteTxFunctionalLanes := mbInitSM.io.remoteFunctionalLanes
+
+  // Keep requester/responder test/calibration interfaces disconnected for now.
+  mbInitSM.io.patternWriterIo := DontCare
+  mbInitSM.io.patternReaderIo := DontCare
+  mbInitSM.io.txPtTestReqInterfaceIo := DontCare
+  mbInitSM.io.txPtTestRespInterfaceIo := DontCare
+
+  mbTrainSM.io.txPtTestReqIntfIo := DontCare
+  mbTrainSM.io.txEyeSweepReqIntfIo := DontCare
+  mbTrainSM.io.rxPtTestReqIntfIo := DontCare
+  mbTrainSM.io.rxEyeSweepReqIntfIo := DontCare
+  mbTrainSM.io.txPtTestRespIntfIo := DontCare
+  mbTrainSM.io.txEyeSweepRespIntfIo := DontCare
+  mbTrainSM.io.rxPtTestRespIntfIo := DontCare
+  mbTrainSM.io.rxEyeSweepRespIntfIo := DontCare
+
+  linkInitSM.io.safeToSendReq := io.linkInitSafeToSendReq
+  linkInitSM.io.safeToSendResp := io.linkInitSafeToSendResp
+
+  trainErrorRequester.io.resetSbMsg := currentStateReg =/= LTState.sTRAINERROR
+  trainErrorResponder.io.resetSbMsg := currentStateReg =/= LTState.sTRAINERROR
+  trainErrorResponder.io.wakeUp := (currentStateReg =/= LTState.sRESET) && (currentStateReg =/= LTState.sTRAINERROR)
+
+  // Sideband routing helpers: one requester + one responder interface per active state.
+  def disableSb(port: SidebandLaneIO): Unit = {
+    port.rx.valid := false.B
+    port.rx.bits.data := 0.U
+    port.tx.ready := false.B
+  }
+
+  disableSb(sbInitSM.io.requesterSbLaneIo)
+  disableSb(sbInitSM.io.responderSbLaneIo)
+  disableSb(mbInitSM.io.requesterSbLaneIo)
+  disableSb(mbInitSM.io.responderSbLaneIo)
+  disableSb(mbTrainSM.io.requesterSbLaneIo)
+  disableSb(mbTrainSM.io.responderSbLaneIo)
+  disableSb(linkInitSM.io.requesterSbLaneIo)
+  disableSb(linkInitSM.io.responderSbLaneIo)
+  disableSb(trainErrorRequester.io.sbLaneIo)
+  disableSb(trainErrorResponder.io.sbLaneIo)
+
+  val sbTxValid = WireDefault(false.B)
+  val sbTxBits = WireDefault(0.U(sbParams.sbNodeMsgWidth.W))
+  val sbRxReady = WireDefault(false.B)
+
+  def routeSb(req: SidebandLaneIO, resp: SidebandLaneIO, enable: Bool): Unit = {
+    when(enable) {
+      req.rx.valid := io.sidebandLaneIo.rx.valid
+      req.rx.bits.data := io.sidebandLaneIo.rx.bits.data
+      resp.rx.valid := io.sidebandLaneIo.rx.valid
+      resp.rx.bits.data := io.sidebandLaneIo.rx.bits.data
+
+      sbRxReady := req.rx.ready || resp.rx.ready
+
+      val reqWins = req.tx.valid
+      sbTxValid := req.tx.valid || resp.tx.valid
+      sbTxBits := Mux(reqWins, req.tx.bits.data, resp.tx.bits.data)
+      req.tx.ready := io.sidebandLaneIo.tx.ready && req.tx.valid
+      resp.tx.ready := io.sidebandLaneIo.tx.ready && !req.tx.valid && resp.tx.valid
+    }
+  }
+
+  routeSb(sbInitSM.io.requesterSbLaneIo, sbInitSM.io.responderSbLaneIo, currentStateReg === LTState.sSBINIT)
+  routeSb(mbInitSM.io.requesterSbLaneIo, mbInitSM.io.responderSbLaneIo, currentStateReg === LTState.sMBINIT)
+  routeSb(mbTrainSM.io.requesterSbLaneIo, mbTrainSM.io.responderSbLaneIo, currentStateReg === LTState.sMBTRAIN)
+  routeSb(linkInitSM.io.requesterSbLaneIo, linkInitSM.io.responderSbLaneIo, currentStateReg === LTState.sLINKINIT)
+  routeSb(trainErrorRequester.io.sbLaneIo, trainErrorResponder.io.sbLaneIo, currentStateReg === LTState.sTRAINERROR)
+
+  io.sidebandLaneIo.tx.valid := sbTxValid
+  io.sidebandLaneIo.tx.bits.data := sbTxBits
+  io.sidebandLaneIo.rx.ready := sbRxReady
+
+  // Defaults for top-level controls
+  io.sidebandCtrlIo.txEn := true.B
+  io.sidebandCtrlIo.rxEn := true.B
+  io.sidebandCtrlIo.rxTxMode := Mux(currentStateReg === LTState.sSBINIT, sbInitSM.io.sbRxTxMode, SBRxTxMode.PACKET)
+  io.sidebandCtrlIo.sbSerDesRst := false.B
+
+  io.mainbandCtrlIo.txDataTriState.foreach(_ := true.B)
+  io.mainbandCtrlIo.txClkTriState := true.B
+  io.mainbandCtrlIo.txValidTriState := true.B
+  io.mainbandCtrlIo.txTrackTriState := true.B
+  io.mainbandCtrlIo.rxDataEn.foreach(_ := false.B)
+  io.mainbandCtrlIo.rxClkEn := false.B
+  io.mainbandCtrlIo.rxValidEn := false.B
+  io.mainbandCtrlIo.rxTrackEn := false.B
+
+  timeoutFreqSel := SpeedMode.speed4
+  io.phyCtrlIo.freqSel := timeoutFreqSel
+
+  when(currentStateReg === LTState.sMBINIT) {
+    io.mainbandCtrlIo := mbInitSM.io.mbLaneCtrlIo
+  }.elsewhen(currentStateReg === LTState.sMBTRAIN) {
+    io.mainbandCtrlIo := mbTrainSM.io.mbLaneCtrlIo
+    when(mbTrainSM.io.freqSel.valid) {
+      timeoutFreqSel := mbTrainSM.io.freqSel.bits
+      io.phyCtrlIo.freqSel := mbTrainSM.io.freqSel.bits
+    }
+  }
+
+  // State transitions
+  switch(currentStateReg) {
+    is(LTState.sRESET) {
+      when(io.trainingBypass) {
+        nextState := io.selectStateBypass
+      }.elsewhen(io.pwrGood && io.phyCtrlIo.pllLock && resetMinWait && io.startTraining) {
+        nextState := LTState.sSBINIT
+      }
+    }
+
+    is(LTState.sSBINIT) {
+      sbInitSM.io.fsmCtrl.start := !trainingTimedout && !sbInitSM.io.fsmCtrl.done
+      when(trainingTimedout) {
+        nextState := LTState.sTRAINERROR
+      }.elsewhen(sbInitSM.io.fsmCtrl.done) {
+        nextState := LTState.sMBINIT
+      }
+    }
+
+    is(LTState.sMBINIT) {
+      mbInitSM.io.fsmCtrl.start := !trainingTimedout && !mbInitSM.io.fsmCtrl.done
+      when(trainingTimedout || mbInitSM.io.fsmCtrl.error) {
+        nextState := LTState.sTRAINERROR
+      }.elsewhen(mbInitSM.io.fsmCtrl.done) {
+        nextState := LTState.sMBTRAIN
+      }
+    }
+
+    is(LTState.sMBTRAIN) {
+      mbTrainSM.io.fsmCtrl.start := !trainingTimedout && !mbTrainSM.io.fsmCtrl.done
+      when(trainingTimedout || mbTrainSM.io.fsmCtrl.error) {
+        nextState := LTState.sTRAINERROR
+      }.elsewhen(mbTrainSM.io.fsmCtrl.done) {
+        when(mbTrainSM.io.currentState === MBTrainState.sTOPHYRETRAIN) {
+          nextState := LTState.sPHYRETRAIN
+        }.otherwise {
+          nextState := LTState.sLINKINIT
+        }
+      }
+    }
+
+    is(LTState.sLINKINIT) {
+      linkInitSM.io.start := !trainingTimedout && !linkInitSM.io.done
+      when(trainingTimedout) {
+        nextState := LTState.sTRAINERROR
+      }.elsewhen(linkInitSM.io.done) {
+        nextState := LTState.sACTIVE
+      }
+    }
+
+    is(LTState.sACTIVE) {
+      when(io.phyInRetrain || io.changeInRuntimeLinkCtrlRegs) {
+        nextState := LTState.sPHYRETRAIN
+      }
+    }
+
+    is(LTState.sPHYRETRAIN) {
+      // Re-enter MBTRAIN and let MBTrain go-to-state policy control sequence.
+      nextState := LTState.sMBTRAIN
+    }
+
+    is(LTState.sL1_L2) {
+      nextState := LTState.sMBTRAIN
+    }
+
+    is(LTState.sTRAINERROR) {
+      trainErrorRequester.io.sendReq := true.B
+      trainErrorResponder.io.sendResp := true.B
+      when(trainErrorRequester.io.done || trainErrorResponder.io.done) {
+        nextState := LTState.sRESET
+      }
+    }
+  }
+
+  io.error := (currentStateReg === LTState.sTRAINERROR) || mbInitSM.io.fsmCtrl.error || mbTrainSM.io.fsmCtrl.error
+  io.done := currentStateReg === LTState.sACTIVE
+  io.negotiatedPhySettings := mbInitSM.io.negotiatedPhySettings
+  io.mbTrainState := mbTrainSM.io.currentState
+}
+
+object MainLinkTrainingStateMachine extends App {
+  circt.stage.ChiselStage.emitSystemVerilogFile(
+    new LinkTrainingStateMachine(new SidebandParams(), new AfeParams()),
+    args = Array("-td", "./generatedVerilog/logphy/"),
+    firtoolOpts = Array(
+      "-O=debug",
+      "-g",
+      "--disable-all-randomization",
+      "--strip-debug-info",
+      "--lowering-options=disallowLocalVariables",
+    ),
+  )
+}
